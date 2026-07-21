@@ -16,6 +16,7 @@ import logging
 import os
 from contextlib import nullcontext
 from copy import deepcopy
+from dataclasses import replace
 from functools import partial
 from itertools import chain
 from typing import Optional
@@ -526,7 +527,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
                 model_config=ref_config.model_config,
                 engine_config=ref_config.engine,
                 optimizer_config=ref_config.optim,
-                checkpoint_config=ref_config.checkpoint,
+                checkpoint_config=replace(ref_config.checkpoint, load_contents=["model"]),
             )
 
             # assign engine configs
@@ -655,6 +656,11 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
     def update_actor(self, data: TensorDict) -> TensorDict:
         output = self.actor.train_mini_batch(data=data)
         return output.cpu() if output is not None else None
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    def reset_ref_policy(self, local_path):
+        assert self._is_ref, "reset_ref_policy requires a reference model"
+        self.ref.load_checkpoint(local_path=local_path)
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def load_checkpoint(self, local_path, hdfs_path=None, del_local_after_load=False):

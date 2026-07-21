@@ -1030,16 +1030,18 @@ class RayPPOTrainer:
             and self.config.actor_rollout_ref.actor.checkpoint["async_save"]
         ):
             print("skip write latest_checkpointed_iteration.txt when async_save is True")
-            return
+            return actor_local_path
         local_latest_checkpointed_iteration = os.path.join(
             self.config.trainer.default_local_dir, "latest_checkpointed_iteration.txt"
         )
         with open(local_latest_checkpointed_iteration, "w") as f:
             f.write(str(self.global_steps))
 
+        return actor_local_path
+
     def _load_checkpoint(self):
         if self.config.trainer.resume_mode == "disable":
-            return 0
+            return None
 
         # load from hdfs
         if self.config.trainer.default_hdfs_dir is not None:
@@ -1055,7 +1057,7 @@ class RayPPOTrainer:
         if self.config.trainer.resume_mode == "auto":
             if global_step_folder is None:
                 print("Training from scratch")
-                return 0
+                return None
         else:
             if self.config.trainer.resume_mode == "resume_path":
                 assert isinstance(self.config.trainer.resume_from_path, str), "resume ckpt must be str type"
@@ -1103,6 +1105,8 @@ class RayPPOTrainer:
                 self.train_dataloader.load_state_dict(dataloader_state_dict)
         else:
             print(f"Warning: No dataloader state found at {dataloader_local_path}, will start from scratch")
+
+        return actor_path
 
     def _start_profiling(self, do_profile: bool) -> None:
         """Start profiling for all worker groups if profiling is enabled."""
@@ -1380,7 +1384,10 @@ class RayPPOTrainer:
         self.global_steps = 0
 
         # load checkpoint and update weights before doing anything
-        self._load_checkpoint()
+        resumed_actor_path = self._load_checkpoint()
+        if resumed_actor_path is not None and self.config.trainer.ref_reset_freq > 0:
+            print(f"Resetting reference policy from resumed actor checkpoint: {resumed_actor_path}")
+            self.ref_policy_wg.reset_ref_policy(local_path=resumed_actor_path)
         self.checkpoint_manager.update_weights(self.global_steps)
 
         current_epoch = self.global_steps // len(self.train_dataloader)
@@ -1421,6 +1428,8 @@ class RayPPOTrainer:
                 if hasattr(self.actor_rollout_wg, "async_calls_finalize_fn_exec"):
                     self.actor_rollout_wg.async_calls_finalize_fn_exec(blocking=False)
                 metrics = {}
+                if self.config.trainer.ref_reset_freq > 0:
+                    metrics["training/ref_policy_reset"] = 0
                 timing_raw = {}
 
                 with marked_timer("start_profile", timing_raw):
@@ -1655,6 +1664,7 @@ class RayPPOTrainer:
                         # 2. It's the last training step.
                         # 3. The current step number is a multiple of the save frequency.
                         # 4. The ESI(Elastic Server Instance)/training plan is close to expiration.
+                        actor_checkpoint_path = None
                         if self.config.trainer.save_freq > 0 and (
                             is_last_step
                             or self.global_steps % self.config.trainer.save_freq == 0
@@ -1663,7 +1673,20 @@ class RayPPOTrainer:
                             if esi_close_to_expiration:
                                 print("Force saving checkpoint: ESI instance expiration approaching.")
                             with marked_timer("save_checkpoint", timing_raw, color="green"):
-                                self._save_checkpoint()
+                                actor_checkpoint_path = self._save_checkpoint()
+
+                        if (
+                            self.config.trainer.ref_reset_freq > 0
+                            and self.global_steps % self.config.trainer.ref_reset_freq == 0
+                        ):
+                            assert actor_checkpoint_path is not None, "reference reset requires an actor checkpoint"
+                            print(
+                                f"Resetting reference policy at global step {self.global_steps} "
+                                f"from actor checkpoint: {actor_checkpoint_path}"
+                            )
+                            with marked_timer("reset_ref_policy", timing_raw, color="olive"):
+                                self.ref_policy_wg.reset_ref_policy(local_path=actor_checkpoint_path)
+                            metrics["training/ref_policy_reset"] = 1
 
                         # update weights from trainer to rollout
                         with marked_timer("update_weights", timing_raw, color="red"):

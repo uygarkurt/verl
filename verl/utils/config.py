@@ -86,6 +86,46 @@ def validate_config(
     # number of GPUs total
     n_gpus = config.trainer.n_gpus_per_node * config.trainer.nnodes
 
+    # Use an exact type check because bool is an int subclass, but True must not mean "reset every step".
+    ref_reset_freq = config.trainer.get("ref_reset_freq", -1)
+    if type(ref_reset_freq) is not int or ref_reset_freq == 0 or ref_reset_freq < -1:
+        raise ValueError("trainer.ref_reset_freq must be -1 (disabled) or a positive integer")
+
+    if ref_reset_freq > 0:
+        if config.trainer.use_v1:
+            raise ValueError("trainer.ref_reset_freq is only supported by the classic trainer (trainer.use_v1=False)")
+        if config.actor_rollout_ref.actor.strategy != "fsdp2":
+            raise ValueError("trainer.ref_reset_freq is only supported with actor strategy fsdp2")
+        if not use_reference_policy:
+            raise ValueError("trainer.ref_reset_freq requires KL loss or KL-in-reward to enable a reference policy")
+
+        save_freq = config.trainer.save_freq
+        if save_freq <= 0 or ref_reset_freq % save_freq != 0:
+            raise ValueError(
+                "trainer.ref_reset_freq requires save_freq > 0 and ref_reset_freq to be a multiple of save_freq"
+            )
+
+        checkpoint_config = config.actor_rollout_ref.actor.checkpoint
+        if checkpoint_config.get("async_save", False):
+            raise ValueError("trainer.ref_reset_freq requires synchronous actor checkpoint saving")
+        # Reset requires model shards only; optimizer/extra may also be saved so this checkpoint remains resumable.
+        if "model" not in checkpoint_config.get("save_contents", []):
+            raise ValueError("trainer.ref_reset_freq requires 'model' in actor checkpoint save_contents")
+
+        model_config = config.actor_rollout_ref.model
+        # Megatron uses the nested model.lora.rank representation.
+        lora_config = model_config.get("lora", {})
+        lora_rank = lora_config.get("rank", 0)
+        # FSDP uses the legacy flat model.lora_rank representation.
+        if lora_rank <= 0:
+            lora_rank = model_config.get("lora_rank", 0)
+        # Adapter paths likewise exist in flat and nested representations.
+        lora_adapter_path = model_config.get("lora_adapter_path") or lora_config.get("adapter_path")
+        if lora_rank > 0 or lora_adapter_path is not None:
+            raise ValueError(
+                "trainer.ref_reset_freq does not support LoRA because its reference is the adapter-disabled base model"
+            )
+
     if not config.actor_rollout_ref.actor.use_dynamic_bsz:
         if config.actor_rollout_ref.actor.strategy == "megatron":
             model_parallel_size = (
